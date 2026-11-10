@@ -1,0 +1,30 @@
+flowchart TD
+  classDef humano fill:#FFE600,stroke:#333333,color:#000000
+  classDef auto fill:#E8F1FF,stroke:#2D6CDF,color:#000000
+  classDef canal fill:#E6F7EC,stroke:#2E8B57,color:#000000
+  classDef dec fill:#FFF4E5,stroke:#E67E22,color:#000000
+
+  A([Inicio: alguien ve un producto bueno]):::humano --> B[Clic en Compartir de la barra de Afiliados]:::humano
+  B --> C[Copiar el link meli.la y la URL de la ficha]:::humano
+  C --> D[Pegar en el formulario web: link, URL, cupón, etiqueta]:::humano
+  D --> E[n8n recibe el formulario]:::auto
+  E --> F{¿Trae URL de la ficha?}:::dec
+  F -- Sí --> G[Sacar el ID del ítem y consultar la API oficial con token]:::auto
+  G --> H[Título, precio, precio anterior y foto oficial]:::auto
+  F -- No --> I[Usar título, precio e imagen escritos en el formulario]:::auto
+  H --> J[Armar la plantilla: producto, precio, descuento, cupón, link intacto]:::auto
+  I --> J
+  J --> K[El modelo local redacta la frase de gancho]:::auto
+  K --> L{¿Pasa la revisión automática? link intacto, sin promesas de más}:::dec
+  L -- No --> M[Aviso a Chino por Telegram para corregir]:::canal
+  M --> D
+  L -- Sí --> N[Publicar en el canal de Telegram]:::canal
+  L -- Sí --> O[Publicar en la página de Facebook]:::canal
+  L -- Sí --> P[Publicar en Instagram]:::canal
+  L -- Sí --> Q[Mandar el mensaje ya armado a Chino]:::canal
+  Q --> R[Chino lo reenvía a sus canales y grupos de WhatsApp]:::humano
+  N --> S[(Registro: producto, etiqueta, fecha, canales)]:::auto
+  O --> S
+  P --> S
+  R --> S
+  S --> T([Fin: métricas por etiqueta en el panel de Afiliados])

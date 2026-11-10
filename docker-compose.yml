@@ -1,0 +1,67 @@
+# Stack independiente para el bot de Telegram @Cazagangasmxbot.
+# n8n con SQLite (sin Postgres, YAGNI: un solo workflow, un solo bot) +
+# Cloudflared quick tunnel propio. No comparte nada con lemut_n8n (otro
+# bot, otro puerto, otro proyecto de compose).
+# Para arrancar: ./scripts/up.sh (necesario para tener la URL del tunnel
+# ANTES de levantar n8n y registrar el webhook con Telegram).
+
+name: afiliados-ml
+
+services:
+  n8n:
+    image: docker.n8n.io/n8nio/n8n:1.80.0
+    restart: unless-stopped
+    # N8N_HOST, N8N_PROTOCOL y WEBHOOK_URL los define .tunnel.env
+    # (generado por scripts/up.sh).
+    env_file:
+      - .tunnel.env
+    environment:
+      GENERIC_TIMEZONE: America/Mexico_City
+      TZ: America/Mexico_City
+      N8N_PORT: 5678
+      N8N_RUNNERS_ENABLED: "true"
+      # El Code node "Validar mensaje" usa require('crypto') (randomInt) para
+      # el código de acceso de 4 dígitos; el task runner lo bloquea por
+      # default sin esto.
+      NODE_FUNCTION_ALLOW_BUILTIN: crypto
+      # Serializa las ejecuciones de producción (webhook): el staticData
+      # global (dedupe, aprobados, bloqueos) se lee y escribe sin lock; dos
+      # updates casi simultáneos podrían pisarse. Confirmado en
+      # config/schema.js de esta imagen (1.80.0, modo regular) que respeta
+      # este límite para ejecuciones de producción.
+      N8N_CONCURRENCY_PRODUCTION_LIMIT: 1
+      # Los nodos HTTP Request llaman a la API de Telegram directo (evita el
+      # parse_mode:Markdown forzado del nodo Telegram nativo); no hay
+      # credencial de n8n involucrada, todo vía estas vars.
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN}
+      TELEGRAM_CHANNEL_ID: ${TELEGRAM_CHANNEL_ID}
+      TELEGRAM_CHANNEL_USERNAME: ${TELEGRAM_CHANNEL_USERNAME}
+      TELEGRAM_ALLOWED_IDS: ${TELEGRAM_ALLOWED_IDS}
+      # Dueño del bot: aprueba altas por código y usa /usuarios, /quitar.
+      TELEGRAM_OWNER_ID: ${TELEGRAM_OWNER_ID}
+      # Secret que el nodo "¿Secret correcto?" del workflow compara contra el
+      # header X-Telegram-Bot-Api-Secret-Token; setup.sh lo genera si falta.
+      TELEGRAM_WEBHOOK_SECRET: ${TELEGRAM_WEBHOOK_SECRET}
+    ports:
+      - "127.0.0.1:5679:5678"
+    volumes:
+      - n8n_data:/home/node/.n8n
+    networks:
+      - afiliados_net
+
+  cloudflared:
+    image: cloudflare/cloudflared:2024.12.2
+    restart: unless-stopped
+    # Quick tunnel: URL pública aleatoria en *.trycloudflare.com, sin
+    # cuenta. Apunta al n8n de este stack (puerto interno 5678, el de
+    # siempre dentro del contenedor; el 5679 es solo el mapeo al host).
+    command: tunnel --no-autoupdate --url http://n8n:5678
+    networks:
+      - afiliados_net
+
+volumes:
+  n8n_data:
+
+networks:
+  afiliados_net:
+    driver: bridge

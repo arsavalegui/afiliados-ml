@@ -1,0 +1,327 @@
+{
+  "id": "AfiliadosPubTG01",
+  "name": "Afiliados - Publicar en Telegram",
+  "active": false,
+  "nodes": [
+    {
+      "id": "node-webhook",
+      "name": "Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        200,
+        300
+      ],
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "afiliados-ml-telegram",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "webhookId": "afiliados-ml-telegram"
+    },
+    {
+      "id": "node-check-secret",
+      "name": "¿Secret correcto?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        420,
+        300
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "combinator": "and",
+          "conditions": [
+            {
+              "id": "cond-secret-set",
+              "leftValue": "={{ $env.TELEGRAM_WEBHOOK_SECRET }}",
+              "rightValue": "",
+              "operator": {
+                "type": "string",
+                "operation": "notEmpty",
+                "singleValue": true
+              }
+            },
+            {
+              "id": "cond-secret",
+              "leftValue": "={{ $json.headers['x-telegram-bot-api-secret-token'] }}",
+              "rightValue": "={{ $env.TELEGRAM_WEBHOOK_SECRET }}",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ]
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "node-respond-403",
+      "name": "Responder 403",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        640,
+        160
+      ],
+      "parameters": {
+        "respondWith": "noData",
+        "options": {
+          "responseCode": 403
+        }
+      }
+    },
+    {
+      "id": "node-respond-ok",
+      "name": "Responder 200",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        640,
+        420
+      ],
+      "parameters": {
+        "respondWith": "noData",
+        "options": {
+          "responseCode": 200
+        }
+      }
+    },
+    {
+      "id": "node-validar",
+      "name": "Validar mensaje",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        860,
+        420
+      ],
+      "parameters": {
+        "jsCode": "// Lógica pura del bot \"Afiliados - Publicar en Telegram\". Testeable con\n// `node workflows/src/validar_mensaje.js` por fuera de n8n. El Code node del\n// workflow pega este archivo tal cual (funciones + bloque de invocación con\n// $input/$env de abajo), mismo patrón que enviar_mensaje.json en lemut_n8n.\n//\n// Dos capas:\n//   - procesarMensaje(): decide acceso (dueño/aprobado/solicitud de código/\n//     comandos de admin) y delega a validarMensaje() cuando el remitente ya\n//     tiene acceso. Devuelve 1 o 2 mensajes a mandar (solicitante + dueño).\n//   - validarMensaje(): asume que el remitente YA tiene acceso; decide si\n//     publica (foto + link válidos) o pide instrucciones.\nconst LIMITE_CAPTION = 1024; // límite real de Telegram para caption de foto.\n// Dominios exactos, anclada (^...$) y probada token por token (ver tieneLink):\n// evita que \"evilmeli.la\", \"evilmercadolibre.com.mx\" o un link ajeno con\n// \"meli.la\" escondido en query string (otro.com/?u=meli.la/x) cuenten como\n// link válido — sin anclar, la regex los matcheaba como substring.\nconst LINK_RE = /^(https?:\\/\\/)?(meli\\.la\\/\\S+|(?:[\\w-]+\\.)*mercadolibre\\.com\\.mx\\/\\S*)$/i;\n\nconst CODIGO_VIGENCIA_MS = 10 * 60 * 1000; // 10 min.\nconst BLOQUEO_MS = 60 * 60 * 1000; // 1 h tras 3 intentos fallidos.\nconst MAX_INTENTOS = 3;\n\n// Ya con acceso confirmado (dueño o aprobado): decide publicar o pedir foto/link.\nfunction validarMensaje(update) {\n  const message = update.message;\n  if (!message || !message.from) return { accion: 'ignorar' };\n\n  const chatId = message.chat.id;\n  const foto = message.photo;\n  const caption = message.caption || '';\n  const tieneFoto = Array.isArray(foto) && foto.length > 0;\n  // Se prueba cada palabra del caption por separado (no el caption completo)\n  // para que el link real pueda venir acompañado de texto (\"Oferta <link>\").\n  const tieneLink = caption.split(/\\s+/).some((token) => LINK_RE.test(token));\n\n  if (!tieneFoto || !tieneLink) {\n    return {\n      accion: 'responder',\n      chatId,\n      texto:\n        'Manda una foto del producto con el link de Mercado Libre ' +\n        '(meli.la/... o mercadolibre.com.mx) en el caption.',\n    };\n  }\n\n  if (caption.length > LIMITE_CAPTION) {\n    return {\n      accion: 'responder',\n      chatId,\n      texto:\n        `El caption tiene ${caption.length} caracteres y el límite de Telegram ` +\n        `es ${LIMITE_CAPTION}. Acórtalo sin tocar el link y vuelve a mandarlo.`,\n    };\n  }\n\n  const fileId = foto[foto.length - 1].file_id;\n  return { accion: 'publicar', chatId, fileId, caption };\n}\n\n// Código de 4 dígitos con crypto.randomInt. require() dentro de la función\n// (no al nivel del módulo) para que funcione igual en node llano (self-check)\n// y en el Code node de n8n, que necesita NODE_FUNCTION_ALLOW_BUILTIN=crypto\n// (ver docker-compose.yml) para permitir este require().\nfunction generarCodigo() {\n  return String(require('crypto').randomInt(10000)).padStart(4, '0');\n}\n\nfunction nombreDe(from) {\n  return [from.first_name, from.last_name].filter(Boolean).join(' ') || 'Alguien';\n}\n\nfunction usernameDe(from) {\n  return from.username ? `@${from.username}` : 'sin username';\n}\n\n// Dueño: \"/usuarios\" lista base (.env) + aprobados. Devuelve null si el\n// texto no es ese comando (para que el caller pruebe el siguiente).\nfunction comandoUsuarios(text, allowedIds, estado) {\n  if (text !== '/usuarios') return null;\n  const base = allowedIds.length ? allowedIds.join(', ') : '(ninguno)';\n  const aprobados = estado.aprobados.length ? estado.aprobados.join(', ') : '(ninguno)';\n  return `Usuarios con acceso:\\nBase (.env): ${base}\\nAprobados: ${aprobados}`;\n}\n\n// Dueño: \"/quitar <id>\". Devuelve el id (string) o null si no es ese comando.\nfunction comandoQuitarId(text) {\n  const m = /^\\/quitar\\s+(\\d+)\\s*$/.exec(text);\n  return m ? m[1] : null;\n}\n\nfunction quitarUsuario(estado, id) {\n  const estaba = estado.aprobados.includes(id);\n  estado.aprobados = estado.aprobados.filter((x) => x !== id);\n  return estaba ? `Quitado: ${id}.` : `${id} no estaba en la lista de aprobados.`;\n}\n\n// Cuenta un fallo en una ventana propia de 1h por fromId, independiente del\n// código/pendiente: así /start (código nuevo) no resetea el conteo y no se\n// esquiva el bloqueo de 3 intentos dejando vencer el código.\nfunction registrarFallo(estado, fromId, now) {\n  if (!estado.fallos) estado.fallos = {}; // staticData persistido antes de este campo.\n  let f = estado.fallos[fromId];\n  if (!f || now - f.desde > BLOQUEO_MS) {\n    f = { cuenta: 0, desde: now };\n    estado.fallos[fromId] = f;\n  }\n  f.cuenta += 1;\n  return f.cuenta;\n}\n\n// Remitente sin acceso: bloqueo, /start (pide código), intento de código, o\n// ignora cualquier otro mensaje (no reenvía fotos/links ajenos al dueño).\nfunction procesarAcceso(estado, update, ownerId, now) {\n  const message = update.message;\n  const fromId = String(message.from.id);\n  const chatId = message.chat.id;\n  const text = (message.text || '').trim();\n\n  const bloqueadoHasta = estado.bloqueados[fromId];\n  if (bloqueadoHasta && bloqueadoHasta > now) {\n    return { resultados: [{ accion: 'ignorar' }], estado }; // bloqueado: silencio total.\n  }\n\n  if (/^\\/start\\b/.test(text)) {\n    const pendienteVigente = estado.pendientes[fromId];\n    // Ya hay una solicitud vigente: no generar código nuevo ni volver a\n    // avisarle al dueño (si no, /start repetido resetea los intentos y\n    // esquiva el bloqueo de 3 fallos, y le llena el chat al dueño de avisos).\n    if (pendienteVigente && pendienteVigente.vence >= now) {\n      return {\n        resultados: [{ accion: 'responder', chatId, texto: 'Ya pediste acceso; pídele el código a Richer.' }],\n        estado,\n      };\n    }\n\n    const codigo = generarCodigo();\n    estado.pendientes[fromId] = { codigo, vence: now + CODIGO_VIGENCIA_MS };\n    return {\n      resultados: [\n        { accion: 'responder', chatId, texto: 'Pide el código de acceso a Richer y escríbelo aquí.' },\n        {\n          accion: 'responder',\n          chatId: ownerId,\n          texto:\n            `Solicitud de acceso: ${nombreDe(message.from)} (${usernameDe(message.from)}, id ${fromId}). ` +\n            'Código: ' + codigo + ' (vence en 10 min). Pásaselo solo si lo conoces.',\n        },\n      ],\n      estado,\n    };\n  }\n\n  if (/^\\d{4}$/.test(text)) {\n    const pendiente = estado.pendientes[fromId];\n    if (!pendiente) return { resultados: [{ accion: 'ignorar' }], estado };\n\n    if (pendiente.vence < now) {\n      delete estado.pendientes[fromId];\n      return {\n        resultados: [{ accion: 'responder', chatId, texto: 'Tu código venció. Escribe /start para pedir uno nuevo.' }],\n        estado,\n      };\n    }\n\n    if (text === pendiente.codigo) {\n      delete estado.pendientes[fromId];\n      estado.aprobados.push(fromId);\n      return {\n        resultados: [\n          { accion: 'responder', chatId, texto: 'Acceso concedido.' },\n          { accion: 'responder', chatId: ownerId, texto: `${nombreDe(message.from)} ya tiene acceso.` },\n        ],\n        estado,\n      };\n    }\n\n    const fallos = registrarFallo(estado, fromId, now);\n    if (fallos >= MAX_INTENTOS) {\n      delete estado.pendientes[fromId];\n      delete estado.fallos[fromId];\n      estado.bloqueados[fromId] = now + BLOQUEO_MS;\n      return {\n        resultados: [\n          { accion: 'responder', chatId, texto: 'Código incorrecto 3 veces. Espera 1 hora e intenta otra vez con /start.' },\n        ],\n        estado,\n      };\n    }\n    return {\n      resultados: [\n        { accion: 'responder', chatId, texto: `Código incorrecto. Te quedan ${MAX_INTENTOS - fallos} intento(s).` },\n      ],\n      estado,\n    };\n  }\n\n  return { resultados: [{ accion: 'ignorar' }], estado };\n}\n\n// Punto de entrada único: decide acceso y delega. `estado` es el staticData\n// global del workflow (aprobados/pendientes/bloqueados); se muta in-place y\n// también se devuelve para persistirlo.\nfunction procesarMensaje(estado, update, allowedIds, ownerId, now) {\n  const message = update.message;\n  if (!message || !message.from) return { resultados: [{ accion: 'ignorar' }], estado };\n\n  const fromId = String(message.from.id);\n  const chatId = message.chat.id;\n  const text = (message.text || '').trim();\n  const esDueño = Boolean(ownerId) && fromId === String(ownerId);\n  const aprobado = allowedIds.includes(fromId) || estado.aprobados.includes(fromId);\n  const permitido = esDueño || aprobado;\n\n  if (esDueño) {\n    const listaUsuarios = comandoUsuarios(text, allowedIds, estado);\n    if (listaUsuarios !== null) {\n      return { resultados: [{ accion: 'responder', chatId, texto: listaUsuarios }], estado };\n    }\n    const idAQuitar = comandoQuitarId(text);\n    if (idAQuitar !== null) {\n      const texto = quitarUsuario(estado, idAQuitar);\n      return { resultados: [{ accion: 'responder', chatId, texto }], estado };\n    }\n  }\n\n  if (permitido) {\n    return { resultados: [validarMensaje(update)], estado };\n  }\n\n  return procesarAcceso(estado, update, ownerId, now);\n}\n\nfunction estadoVacio() {\n  return { aprobados: [], pendientes: {}, bloqueados: {}, fallos: {} };\n}\n\nif (typeof module !== 'undefined') {\n  module.exports = { validarMensaje, procesarMensaje, estadoVacio, LIMITE_CAPTION, LINK_RE };\n}\n\n// --- Bloque de invocación dentro de n8n (Code node) ---\n// Fuera de n8n, $input/$env no existen y este bloque no corre (ver demo()).\nif (typeof $input !== 'undefined') {\n  // El Webhook node (no el Telegram Trigger) entrega el update de Telegram\n  // dentro de `.body`; headers/query quedan en hermanos de ese campo.\n  const update = $input.first().json.body;\n\n  const staticData = $getWorkflowStaticData('global');\n\n  // Dedupe por update_id: Telegram puede reentregar el mismo update (retries\n  // de red); sin esto se publicaría/respondería dos veces. Se guarda en\n  // staticData global del workflow (persiste entre ejecuciones).\n  const vistos = staticData.updateIdsVistos || (staticData.updateIdsVistos = []);\n  if (update.update_id !== undefined) {\n    if (vistos.includes(update.update_id)) {\n      return [{ json: { accion: 'ignorar' } }];\n    }\n    vistos.push(update.update_id);\n    if (vistos.length > 200) vistos.splice(0, vistos.length - 200); // solo últimos ~200.\n  }\n\n  const allowedIds = ($env.TELEGRAM_ALLOWED_IDS || '')\n    .split(',')\n    .map((s) => s.trim())\n    .filter(Boolean);\n  const accesos = staticData.accesos || (staticData.accesos = estadoVacio());\n  const resultado = procesarMensaje(accesos, update, allowedIds, $env.TELEGRAM_OWNER_ID, Date.now());\n  return resultado.resultados.map((r) => ({ json: r }));\n}\n\n// --- Self-check mínimo (node workflows/src/validar_mensaje.js) ---\nfunction demo() {\n  const assert = require('assert');\n  const ALLOWED = ['111111111'];\n  const OWNER = '222222222';\n  const base = (extra) => ({ message: { from: { id: 111111111 }, chat: { id: 111111111 }, ...extra } });\n  const msj = (fromId, extra) => ({ message: { from: { id: fromId, first_name: 'Ana' }, chat: { id: fromId }, ...extra } });\n\n  // --- foto + link, ya con acceso (vía procesarMensaje, flujo real) ---\n\n  // Permitido, foto + link meli.la → publicar.\n  let r = procesarMensaje(\n    estadoVacio(),\n    base({ photo: [{ file_id: 'a' }, { file_id: 'b' }], caption: 'Oferta https://meli.la/1NqM8Rd' }),\n    ALLOWED,\n    OWNER,\n    1000,\n  );\n  assert.strictEqual(r.resultados.length, 1);\n  assert.strictEqual(r.resultados[0].accion, 'publicar');\n  assert.strictEqual(r.resultados[0].fileId, 'b'); // la de mayor resolución es la última.\n\n  // Permitido, foto + link mercadolibre.com.mx sin https → publicar.\n  r = procesarMensaje(\n    estadoVacio(),\n    base({ photo: [{ file_id: 'x' }], caption: 'Ver articulo.mercadolibre.com.mx/MLM-123' }),\n    ALLOWED,\n    OWNER,\n    1000,\n  );\n  assert.strictEqual(r.resultados[0].accion, 'publicar');\n\n  // Permitido, sin foto → instrucciones.\n  r = procesarMensaje(estadoVacio(), base({ text: 'https://meli.la/1NqM8Rd' }), ALLOWED, OWNER, 1000);\n  assert.strictEqual(r.resultados[0].accion, 'responder');\n\n  // Permitido, con foto pero sin link → instrucciones.\n  r = procesarMensaje(estadoVacio(), base({ photo: [{ file_id: 'a' }], caption: 'sin link aquí' }), ALLOWED, OWNER, 1000);\n  assert.strictEqual(r.resultados[0].accion, 'responder');\n\n  // Permitido, caption de más de 1024 → rechaza (no trunca).\n  r = procesarMensaje(\n    estadoVacio(),\n    base({ photo: [{ file_id: 'a' }], caption: 'https://meli.la/x ' + 'a'.repeat(1030) }),\n    ALLOWED,\n    OWNER,\n    1000,\n  );\n  assert.strictEqual(r.resultados[0].accion, 'responder');\n  assert.ok(r.resultados[0].texto.includes('1024'));\n\n  // Update sin message (ej. edited_message si algún día se suscribe) → ignorar.\n  r = procesarMensaje(estadoVacio(), {}, ALLOWED, OWNER, 1000);\n  assert.strictEqual(r.resultados[0].accion, 'ignorar');\n\n  // Dominio falsificado \"evilmeli.la\" (no es meli.la) → no cuenta como link.\n  r = procesarMensaje(estadoVacio(), base({ photo: [{ file_id: 'a' }], caption: 'Oferta evilmeli.la/producto' }), ALLOWED, OWNER, 1000);\n  assert.strictEqual(r.resultados[0].accion, 'responder');\n\n  // Dominio falsificado \"evilmercadolibre.com.mx\" → no cuenta como link.\n  r = procesarMensaje(estadoVacio(), base({ photo: [{ file_id: 'a' }], caption: 'Ver evilmercadolibre.com.mx/MLM-1' }), ALLOWED, OWNER, 1000);\n  assert.strictEqual(r.resultados[0].accion, 'responder');\n\n  // Link ajeno con \"meli.la\" escondido en query string → el host real es\n  // otro.com, no cuenta como link válido.\n  r = procesarMensaje(estadoVacio(), base({ photo: [{ file_id: 'a' }], caption: 'https://otro.com/?u=meli.la/x' }), ALLOWED, OWNER, 1000);\n  assert.strictEqual(r.resultados[0].accion, 'responder');\n\n  // --- alta de usuarios por código ---\n\n  // No permitido + /start → pide código al solicitante y manda el código al dueño.\n  let estado = estadoVacio();\n  r = procesarMensaje(estado, msj(999, { text: '/start' }), ALLOWED, OWNER, 1000);\n  assert.strictEqual(r.resultados.length, 2);\n  assert.strictEqual(r.resultados[0].chatId, 999);\n  assert.ok(r.resultados[0].texto.includes('código'));\n  assert.strictEqual(r.resultados[1].chatId, OWNER);\n  assert.ok(r.resultados[1].texto.includes('Ana') && r.resultados[1].texto.includes('999'));\n  const codigoReal = estado.pendientes['999'].codigo;\n\n  // No permitido + cualquier otra cosa (no /start, no código) → se ignora.\n  r = procesarMensaje(estadoVacio(), msj(999, { text: 'hola' }), ALLOWED, OWNER, 1000);\n  assert.strictEqual(r.resultados[0].accion, 'ignorar');\n\n  // Código correcto antes de vencer → aprobado; avisa a ambos.\n  r = procesarMensaje(estado, msj(999, { text: codigoReal }), ALLOWED, OWNER, 1500);\n  assert.strictEqual(r.resultados.length, 2);\n  assert.ok(r.resultados[0].texto.includes('concedido'));\n  assert.strictEqual(r.resultados[1].chatId, OWNER);\n  assert.ok(r.resultados[1].texto.includes('Ana'));\n  assert.ok(estado.aprobados.includes('999'));\n\n  // Código incorrecto (1er intento) → avisa, no bloquea.\n  estado = estadoVacio();\n  estado.pendientes['999'] = { codigo: '1234', vence: 100000 };\n  r = procesarMensaje(estado, msj(999, { text: '0000' }), ALLOWED, OWNER, 1000);\n  assert.strictEqual(r.resultados[0].accion, 'responder');\n  assert.ok(r.resultados[0].texto.includes('incorrecto'));\n  assert.strictEqual(estado.fallos['999'].cuenta, 1);\n\n  // 3 fallos → bloqueado 1h; mientras dura, hasta el código correcto se ignora.\n  estado = estadoVacio();\n  estado.pendientes['999'] = { codigo: '1234', vence: 100000 };\n  estado.fallos['999'] = { cuenta: 2, desde: 1000 };\n  r = procesarMensaje(estado, msj(999, { text: '0000' }), ALLOWED, OWNER, 1000);\n  assert.ok(r.resultados[0].texto.includes('1 hora'));\n  assert.strictEqual(estado.bloqueados['999'], 1000 + 60 * 60 * 1000);\n  r = procesarMensaje(estado, msj(999, { text: '1234' }), ALLOWED, OWNER, 1000 + 10);\n  assert.strictEqual(r.resultados[0].accion, 'ignorar');\n\n  // /start con una solicitud YA vigente → no genera código nuevo ni avisa\n  // otra vez al dueño, y el contador de fallos (ventana propia, separado\n  // del código) tampoco se resetea.\n  estado = estadoVacio();\n  estado.pendientes['999'] = { codigo: '1234', vence: 100000 };\n  estado.fallos['999'] = { cuenta: 2, desde: 1000 };\n  r = procesarMensaje(estado, msj(999, { text: '/start' }), ALLOWED, OWNER, 1000);\n  assert.strictEqual(r.resultados.length, 1);\n  assert.strictEqual(r.resultados[0].chatId, 999);\n  assert.strictEqual(estado.pendientes['999'].codigo, '1234');\n  assert.strictEqual(estado.fallos['999'].cuenta, 2);\n  // Un fallo más SÍ debe bloquearlo (no se esquivó el contador).\n  r = procesarMensaje(estado, msj(999, { text: '0000' }), ALLOWED, OWNER, 1000);\n  assert.ok(r.resultados[0].texto.includes('1 hora'));\n  assert.ok(estado.bloqueados['999']);\n\n  // El mismo caso pero dejando VENCER el código entre fallo y fallo (no solo\n  // \"vigente\"): hasta 20 ciclos de /start + 2 intentos incorrectos — el\n  // contador de fallos tiene ventana propia de 1h, independiente del\n  // código, así que bloquea aunque cada ciclo pida un código nuevo (antes,\n  // /start reseteaba el conteo y el bloqueo se esquivaba indefinidamente).\n  estado = estadoVacio();\n  let momento = 1000;\n  let ciclos = 0;\n  for (; ciclos < 20 && !estado.bloqueados['999']; ciclos++) {\n    if (estado.pendientes['999']) estado.pendientes['999'].vence = momento - 1; // forzar vencido\n    procesarMensaje(estado, msj(999, { text: '/start' }), ALLOWED, OWNER, momento);\n    for (let intento = 0; intento < 2 && estado.pendientes['999'] && !estado.bloqueados['999']; intento++) {\n      const pend = estado.pendientes['999'];\n      const incorrecto = pend.codigo === '0000' ? '1111' : '0000';\n      procesarMensaje(estado, msj(999, { text: incorrecto }), ALLOWED, OWNER, momento + 1);\n    }\n    momento += 3;\n  }\n  assert.ok(estado.bloqueados['999'], 'debió bloquear antes de 20 ciclos');\n  assert.ok(ciclos < 20);\n\n  // Código vencido → no aprueba, pide reiniciar con /start.\n  estado = estadoVacio();\n  estado.pendientes['999'] = { codigo: '1234', vence: 500 };\n  r = procesarMensaje(estado, msj(999, { text: '1234' }), ALLOWED, OWNER, 1000);\n  assert.ok(r.resultados[0].texto.includes('venció'));\n  assert.ok(!estado.pendientes['999']);\n  assert.ok(!estado.aprobados.includes('999'));\n\n  // Dueño: /quitar <id> saca a alguien de aprobados.\n  estado = estadoVacio();\n  estado.aprobados.push('777');\n  r = procesarMensaje(estado, msj(Number(OWNER), { text: '/quitar 777' }), ALLOWED, OWNER, 1000);\n  assert.ok(r.resultados[0].texto.includes('Quitado'));\n  assert.ok(!estado.aprobados.includes('777'));\n\n  // No-dueño usando /quitar → se ignora, no se quita a nadie.\n  estado = estadoVacio();\n  estado.aprobados.push('777');\n  r = procesarMensaje(estado, msj(999, { text: '/quitar 777' }), ALLOWED, OWNER, 1000);\n  assert.strictEqual(r.resultados[0].accion, 'ignorar');\n  assert.ok(estado.aprobados.includes('777'));\n\n  console.log('OK: validar_mensaje.js — 22 casos pasaron');\n}\n\nif (typeof require !== 'undefined' && require.main === module) {\n  demo();\n}\n"
+      }
+    },
+    {
+      "id": "node-switch",
+      "name": "¿Qué hacer?",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3.2,
+      "position": [
+        1080,
+        420
+      ],
+      "parameters": {
+        "rules": {
+          "values": [
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "loose",
+                  "version": 2
+                },
+                "combinator": "and",
+                "conditions": [
+                  {
+                    "id": "cond-responder",
+                    "leftValue": "={{ $json.accion }}",
+                    "rightValue": "responder",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ]
+              },
+              "renameOutput": true,
+              "outputKey": "responder"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "loose",
+                  "version": 2
+                },
+                "combinator": "and",
+                "conditions": [
+                  {
+                    "id": "cond-publicar",
+                    "leftValue": "={{ $json.accion }}",
+                    "rightValue": "publicar",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ]
+              },
+              "renameOutput": true,
+              "outputKey": "publicar"
+            }
+          ]
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "node-enviar-mensaje",
+      "name": "Enviar mensaje",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1340,
+        300
+      ],
+      "onError": "continueRegularOutput",
+      "parameters": {
+        "method": "POST",
+        "url": "=https://api.telegram.org/bot{{ $env.TELEGRAM_BOT_TOKEN }}/sendMessage",
+        "sendBody": true,
+        "contentType": "raw",
+        "rawContentType": "application/json",
+        "body": "={{ JSON.stringify({ chat_id: $json.chatId, text: $json.texto }) }}",
+        "options": {}
+      }
+    },
+    {
+      "id": "node-publicar-canal",
+      "name": "Publicar en canal",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1340,
+        560
+      ],
+      "onError": "continueRegularOutput",
+      "parameters": {
+        "method": "POST",
+        "url": "=https://api.telegram.org/bot{{ $env.TELEGRAM_BOT_TOKEN }}/sendPhoto",
+        "sendBody": true,
+        "contentType": "raw",
+        "rawContentType": "application/json",
+        "body": "={{ JSON.stringify({ chat_id: $env.TELEGRAM_CHANNEL_ID, photo: $json.fileId, caption: $json.caption }) }}",
+        "options": {}
+      }
+    },
+    {
+      "id": "node-preparar-confirmacion",
+      "name": "Preparar confirmación",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1560,
+        560
+      ],
+      "parameters": {
+        "jsCode": "// Arma el mensaje de confirmación con el link real al post recién\n// publicado (usa el message_id que Telegram acaba de devolver, y el\n// chatId del remitente original que mandó la foto, no el del canal).\nconst resp = $input.first().json;\nconst chatId = $('Validar mensaje').first().json.chatId;\nif (!resp.ok) {\n  return [{ json: { chatId, texto: 'No se pudo publicar en el canal: ' + (resp.description || 'error desconocido') } }];\n}\nconst messageId = resp.result.message_id;\nconst link = `https://t.me/${$env.TELEGRAM_CHANNEL_USERNAME}/${messageId}`;\nreturn [{ json: { chatId, texto: `Publicado en el canal: ${link}` } }];"
+      }
+    }
+  ],
+  "connections": {
+    "Webhook": {
+      "main": [
+        [
+          {
+            "node": "¿Secret correcto?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "¿Secret correcto?": {
+      "main": [
+        [
+          {
+            "node": "Responder 200",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Responder 403",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Responder 200": {
+      "main": [
+        [
+          {
+            "node": "Validar mensaje",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Validar mensaje": {
+      "main": [
+        [
+          {
+            "node": "¿Qué hacer?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "¿Qué hacer?": {
+      "main": [
+        [
+          {
+            "node": "Enviar mensaje",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Publicar en canal",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Publicar en canal": {
+      "main": [
+        [
+          {
+            "node": "Preparar confirmación",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Preparar confirmación": {
+      "main": [
+        [
+          {
+            "node": "Enviar mensaje",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "timezone": "America/Mexico_City"
+  }
+}
