@@ -9,8 +9,9 @@
 //     tiene acceso. Devuelve 1 o 2 mensajes a mandar (solicitante + dueño).
 //   - validarMensaje(): asume que el remitente YA tiene acceso; decide si
 //     publica (foto + link válidos) o pide instrucciones.
-const LIMITE_CAPTION = 1024; // límite real de Telegram para caption de foto.
-// Dominios exactos, anclada (^...$) y probada token por token (ver tieneLink):
+const LIMITE_CAPTION = 1024; // límite real de Telegram para caption de foto (sendPhoto).
+const LIMITE_TEXTO_CUPONES = 4096; // límite real de Telegram para sendMessage (anuncio de cupones).
+// Dominios exactos, anclada (^...$) y probada token por token (ver extraerLink):
 // evita que "evilmeli.la", "evilmercadolibre.com.mx" o un link ajeno con
 // "meli.la" escondido en query string (otro.com/?u=meli.la/x) cuenten como
 // link válido — sin anclar, la regex los matcheaba como substring.
@@ -20,20 +21,92 @@ const CODIGO_VIGENCIA_MS = 10 * 60 * 1000; // 10 min.
 const BLOQUEO_MS = 60 * 60 * 1000; // 1 h tras 3 intentos fallidos.
 const MAX_INTENTOS = 3;
 
-// Ya con acceso confirmado (dueño o aprobado): decide publicar o pedir foto/link.
+// Busca el link real dentro de un texto (caption de foto) probando cada
+// palabra por separado (no el texto completo), para que el link pueda venir
+// acompañado de texto propio ("Oferta <link>"). Devuelve el token exacto
+// (lo necesita motor_caption.js para armar el caption nuevo con el link
+// EXACTO como lo mandó el usuario, sin duplicar LINK_RE en otro Code node)
+// y el texto restante sin el link.
+function extraerLink(texto) {
+  const tokens = (texto || '').split(/\s+/);
+  const linkToken = tokens.find((token) => LINK_RE.test(token));
+  if (!linkToken) return null;
+  const textoSinLink = tokens.filter((t) => t !== linkToken).join(' ').trim();
+  return { link: linkToken, textoSinLink };
+}
+
+// Un mensaje de texto (sin foto) "parece" un anuncio de cupones generales
+// si menciona la palabra cupón/cupones o código — con o sin link: el link,
+// si trae uno, casi siempre es de OTRA persona (su propio link de
+// afiliado), nunca se publica (ver quitarLinks). La validación real de qué
+// códigos son legítimos pasa después, en motor_cupones.js, contra el texto
+// ya sin links.
+const PARECE_CUPONES_RE = /cup[oó]n(es)?|c[oó]digo/i;
+
+// Cualquier URL se quita del texto ANTES de mandarlo al LLM y antes de
+// publicar el fallback — nunca se publica un link que no es nuestro.
+// Genérica a propósito: no solo http(s):// ni solo meli.la/
+// mercadolibre.com.mx, también cualquier dominio.tld(/ruta) SIN esquema
+// (bit.ly/abc, t.me/canal, www.otro.com, x.com/algo...). El TLD final debe
+// ser solo letras (2+) para no atrapar precios/decimales ("13,229.02").
+const URL_GENERICA_RE = /https?:\/\/\S+|\b[\w-]+(?:\.[\w-]+)*\.[a-z]{2,}(?:\/\S*)?\b/gi;
+function quitarLinks(texto) {
+  return (texto || '')
+    .replace(URL_GENERICA_RE, '')
+    .replace(/[ \t]+$/gm, '') // espacios colgantes al final de línea, tras quitar el link.
+    .replace(/\n{3,}/g, '\n\n') // no más de una línea en blanco seguida.
+    .trim();
+}
+
+// Ya con acceso confirmado (dueño o aprobado): decide publicar (foto+link),
+// cupones (texto sin foto + link, ver motor_cupones.js) o pedir instrucciones.
 function validarMensaje(update) {
   const message = update.message;
   if (!message || !message.from) return { accion: 'ignorar' };
 
   const chatId = message.chat.id;
   const foto = message.photo;
-  const caption = message.caption || '';
   const tieneFoto = Array.isArray(foto) && foto.length > 0;
-  // Se prueba cada palabra del caption por separado (no el caption completo)
-  // para que el link real pueda venir acompañado de texto ("Oferta <link>").
-  const tieneLink = caption.split(/\s+/).some((token) => LINK_RE.test(token));
 
-  if (!tieneFoto || !tieneLink) {
+  if (tieneFoto) {
+    const caption = message.caption || '';
+    const extraido = extraerLink(caption);
+    if (!extraido) {
+      return {
+        accion: 'responder',
+        chatId,
+        texto:
+          'Manda una foto del producto con el link de Mercado Libre ' +
+          '(meli.la/... o mercadolibre.com.mx) en el caption.',
+      };
+    }
+    if (caption.length > LIMITE_CAPTION) {
+      return {
+        accion: 'responder',
+        chatId,
+        texto:
+          `El caption tiene ${caption.length} caracteres y el límite de Telegram ` +
+          `es ${LIMITE_CAPTION}. Acórtalo sin tocar el link y vuelve a mandarlo.`,
+      };
+    }
+    const fileId = foto[foto.length - 1].file_id;
+    return {
+      accion: 'publicar',
+      chatId,
+      fileId,
+      caption,
+      link: extraido.link,
+      textoUsuario: extraido.textoSinLink,
+    };
+  }
+
+  // Sin foto: un mensaje de texto que PAREZCA anuncio de cupones generales
+  // (ej. cupones bancarios del Buen Fin) va por motor_cupones.js, no por
+  // motor_caption.js — con o sin link (si trae uno, se quita: casi siempre
+  // es el link de afiliado de OTRA persona, nunca se publica). Cualquier
+  // otro texto sin foto sigue el camino de siempre: instrucciones.
+  const texto = message.text || '';
+  if (!PARECE_CUPONES_RE.test(texto)) {
     return {
       accion: 'responder',
       chatId,
@@ -43,18 +116,18 @@ function validarMensaje(update) {
     };
   }
 
-  if (caption.length > LIMITE_CAPTION) {
+  const textoSinLinks = quitarLinks(texto);
+  if (textoSinLinks.length > LIMITE_TEXTO_CUPONES) {
     return {
       accion: 'responder',
       chatId,
       texto:
-        `El caption tiene ${caption.length} caracteres y el límite de Telegram ` +
-        `es ${LIMITE_CAPTION}. Acórtalo sin tocar el link y vuelve a mandarlo.`,
+        `El mensaje tiene ${textoSinLinks.length} caracteres y el límite de Telegram ` +
+        `es ${LIMITE_TEXTO_CUPONES}. Acórtalo y vuelve a mandarlo.`,
     };
   }
 
-  const fileId = foto[foto.length - 1].file_id;
-  return { accion: 'publicar', chatId, fileId, caption };
+  return { accion: 'cupones', chatId, texto: textoSinLinks };
 }
 
 // Código de 4 dígitos con crypto.randomInt. require() dentro de la función
@@ -235,7 +308,16 @@ function estadoVacio() {
 }
 
 if (typeof module !== 'undefined') {
-  module.exports = { validarMensaje, procesarMensaje, estadoVacio, LIMITE_CAPTION, LINK_RE };
+  module.exports = {
+    validarMensaje,
+    procesarMensaje,
+    estadoVacio,
+    extraerLink,
+    quitarLinks,
+    LIMITE_CAPTION,
+    LIMITE_TEXTO_CUPONES,
+    LINK_RE,
+  };
 }
 
 // --- Bloque de invocación dentro de n8n (Code node) ---
@@ -289,6 +371,18 @@ function demo() {
   assert.strictEqual(r.resultados.length, 1);
   assert.strictEqual(r.resultados[0].accion, 'publicar');
   assert.strictEqual(r.resultados[0].fileId, 'b'); // la de mayor resolución es la última.
+  assert.strictEqual(r.resultados[0].link, 'https://meli.la/1NqM8Rd');
+  assert.strictEqual(r.resultados[0].textoUsuario, 'Oferta'); // el link se excluye del texto del usuario.
+
+  // Caption = solo el link (sin texto propio) → textoUsuario vacío.
+  r = procesarMensaje(
+    estadoVacio(),
+    base({ photo: [{ file_id: 'a' }], caption: 'https://meli.la/1NqM8Rd' }),
+    ALLOWED,
+    OWNER,
+    1000,
+  );
+  assert.strictEqual(r.resultados[0].textoUsuario, '');
 
   // Permitido, foto + link mercadolibre.com.mx sin https → publicar.
   r = procesarMensaje(
@@ -300,9 +394,40 @@ function demo() {
   );
   assert.strictEqual(r.resultados[0].accion, 'publicar');
 
-  // Permitido, sin foto → instrucciones.
-  r = procesarMensaje(estadoVacio(), base({ text: 'https://meli.la/1NqM8Rd' }), ALLOWED, OWNER, 1000);
+  // Permitido, sin foto, menciona "cupones" y NO trae ningún link →
+  // cupones generales de todos modos (es la ruta nueva para
+  // motor_cupones.js; ya no depende de que venga un link).
+  r = procesarMensaje(estadoVacio(), base({ text: 'Nuevos cupones del Buen Fin, usa el código ABC123' }), ALLOWED, OWNER, 1000);
+  assert.strictEqual(r.resultados[0].accion, 'cupones');
+  assert.strictEqual(r.resultados[0].texto, 'Nuevos cupones del Buen Fin, usa el código ABC123');
+  assert.ok(!('link' in r.resultados[0])); // ya no se usa ningún link en esta plantilla.
+
+  // Permitido, sin foto, menciona "cupones" y SÍ trae un link (casi
+  // siempre de OTRA persona, su link de afiliado) → se quita el link antes
+  // de seguir; el texto resultante no debe traer "meli.la" ni "http".
+  r = procesarMensaje(estadoVacio(), base({ text: 'Cupones nuevos https://meli.la/1FBrqqE más info' }), ALLOWED, OWNER, 1000);
+  assert.strictEqual(r.resultados[0].accion, 'cupones');
+  assert.ok(!r.resultados[0].texto.toLowerCase().includes('meli.la'));
+  assert.ok(!r.resultados[0].texto.toLowerCase().includes('http'));
+  assert.strictEqual(r.resultados[0].texto, 'Cupones nuevos  más info'); // doble espacio donde estaba el link, sin rarezas.
+
+  // Permitido, sin foto, cupones con un link SIN esquema (bit.ly/t.me/
+  // dominio.com, no solo http(s):// o meli.la/mercadolibre.com.mx) → igual
+  // se quita (bug ALTA reportado por el revisor: antes solo quitaba
+  // http(s):// o los dos dominios de Mercado Libre).
+  r = procesarMensaje(estadoVacio(), base({ text: 'Cupones: código ABC123, info en bit.ly/promo40' }), ALLOWED, OWNER, 1000);
+  assert.strictEqual(r.resultados[0].accion, 'cupones');
+  assert.ok(!r.resultados[0].texto.includes('bit.ly'));
+
+  // Permitido, sin foto, sin la palabra cupón/código y sin foto →
+  // instrucciones (no todo texto cuenta como cupones).
+  r = procesarMensaje(estadoVacio(), base({ text: 'hola, alguna novedad?' }), ALLOWED, OWNER, 1000);
   assert.strictEqual(r.resultados[0].accion, 'responder');
+
+  // Permitido, mensaje de cupones de más de 4096 caracteres → rechaza (no trunca).
+  r = procesarMensaje(estadoVacio(), base({ text: 'Cupones: ' + 'a'.repeat(4090) }), ALLOWED, OWNER, 1000);
+  assert.strictEqual(r.resultados[0].accion, 'responder');
+  assert.ok(r.resultados[0].texto.includes('4096'));
 
   // Permitido, con foto pero sin link → instrucciones.
   r = procesarMensaje(estadoVacio(), base({ photo: [{ file_id: 'a' }], caption: 'sin link aquí' }), ALLOWED, OWNER, 1000);
@@ -437,7 +562,7 @@ function demo() {
   assert.strictEqual(r.resultados[0].accion, 'ignorar');
   assert.ok(estado.aprobados.includes('777'));
 
-  console.log('OK: validar_mensaje.js — 22 casos pasaron');
+  console.log('OK: validar_mensaje.js — 28 casos pasaron');
 }
 
 if (typeof require !== 'undefined' && require.main === module) {

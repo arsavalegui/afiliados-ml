@@ -11,6 +11,12 @@ services:
   n8n:
     image: docker.n8n.io/n8nio/n8n:1.80.0
     restart: unless-stopped
+    # El modelo de visión (análisis de captura para armar el caption) corre
+    # en Ollama LOCAL del host (systemd de usuario, puerto 11434), mismo
+    # proveedor que usa lemut_n8n para el LLM de RAG. host-gateway permite
+    # que el contenedor lo alcance como host.docker.internal.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     # N8N_HOST, N8N_PROTOCOL y WEBHOOK_URL los define .tunnel.env
     # (generado por scripts/up.sh).
     env_file:

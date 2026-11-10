@@ -11,6 +11,7 @@
 #   3. Escribe .tunnel.env con la URL buena
 #   4. Recrea n8n con la URL actualizada en su env
 #   5. Registra el webhook en Telegram con esa URL (setWebhook) y lo verifica
+#   6. Precarga el modelo de visión en Ollama (si está corriendo en el host)
 #
 # Uso: ./scripts/up.sh
 # Primera vez: antes de este script corre ./scripts/setup.sh (crea el owner,
@@ -20,6 +21,13 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 touch .tunnel.env
+
+# Modelo de visión del nodo "Analizar imagen" (workflows/src/motor_caption.js
+# usa su salida) y modelo de texto del nodo "Analizar cupones"
+# (workflows/src/motor_cupones.js) — mismos nombres que $env.model en esos
+# nodos del workflow; si se cambia uno, cambiar el otro.
+MODELO_VISION="qwen2.5vl:3b"
+MODELO_TEXTO_CUPONES="qwen2.5:3b-instruct"
 
 # Path fijo del nodo "Webhook" del workflow (ver
 # workflows/afiliados_publicar_telegram.json, parámetro `path`) — si se
@@ -155,6 +163,39 @@ else
     exit 1
   fi
   echo "✓ Webhook de Telegram registrado: $WEBHOOK_URL_FULL"
+fi
+
+echo "▶ Precargando el modelo de visión en Ollama (si está corriendo en el host)..."
+# "keep_alive" sin prompt real: Ollama carga el modelo a RAM sin generar
+# nada, para que el primer post real no pague además el costo de cargar los
+# pesos a RAM desde cero (el análisis en sí tarda ~60s con el modelo ya
+# cargado, medido con qwen2.5vl:3b — ver README). No se usa `set -e` aquí:
+# si Ollama no está corriendo en el host, el workflow sigue funcionando
+# igual, solo que el primer análisis de imagen puede tardar más (con
+# fallback al caption original si pasa de 120s).
+if curl -sf -m 5 -X POST http://localhost:11434/api/generate \
+  -H 'Content-Type: application/json' \
+  -d "{\"model\":\"${MODELO_VISION}\",\"keep_alive\":\"2h\"}" >/dev/null 2>&1; then
+  echo "  ✓ Modelo '$MODELO_VISION' precargado (se queda caliente ~2h)."
+else
+  echo "  Aviso: no se pudo precargar (¿Ollama no está corriendo? revisa"
+  echo "  'systemctl --user status ollama' en el host). El workflow sigue"
+  echo "  funcionando: si el análisis de imagen falla/tarda, cae a fallback"
+  echo "  (publica el caption original) y avisa al dueño."
+fi
+
+echo "▶ Precargando el modelo de texto (análisis de cupones) en Ollama..."
+# Mismo criterio que el de visión: nodo "Analizar cupones" (anuncios de
+# cupones generales, texto sin foto — ver motor_cupones.js). Medido en frío
+# ~59s con qwen2.5:3b-instruct, de ahí el timeout de 120s en ese nodo.
+if curl -sf -m 5 -X POST http://localhost:11434/api/generate \
+  -H 'Content-Type: application/json' \
+  -d "{\"model\":\"${MODELO_TEXTO_CUPONES}\",\"keep_alive\":\"2h\"}" >/dev/null 2>&1; then
+  echo "  ✓ Modelo '$MODELO_TEXTO_CUPONES' precargado (se queda caliente ~2h)."
+else
+  echo "  Aviso: no se pudo precargar. El workflow sigue funcionando: si el"
+  echo "  análisis de cupones falla/tarda, cae a fallback (publica el texto"
+  echo "  original con *negritas* convertidas a <b>) y avisa al dueño."
 fi
 
 echo ""
